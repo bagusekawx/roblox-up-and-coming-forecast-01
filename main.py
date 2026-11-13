@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Forecast Roblox's Up-and-Coming top 10 for the next 72 hours.
+"""Forecast Roblox's Up-and-Coming top 10 for the next 72 hours (v2).
 
-Approach: Monte Carlo rank diffusion. Every game on the closing chart gets a
+Monte Carlo rank diffusion (v1 core): every game on the closing chart gets a
 latent rank that drifts each hour by its shrunk recent rank velocity (momentum
 is weakly persistent, corr ~0.2) plus a small global downward push from new
 entrants, with rank-dependent Gaussian noise. Games can die (empirical
@@ -11,15 +11,31 @@ days after creation when the creation date is known. A last-read playing-share
 surge (share at least doubled) adds a short-lived upward kick: extreme surges
 are the one playing signal that predicts the next rank move.
 
+v2 adds an explicit entrant component. The Monte Carlo gives deep-rank games
+almost no top-10 mass (a rank-50 game's occupancy peaks below 0.0015), yet
+games ranked 21+ hold about 18% of top-10 places over a 72h window. The
+entrant component hands each deep band its empirical share of each place
+(measured over 47 forecast points in the history) and splits it inside the
+band by an entry score: climbing rank velocity (climbing 21-40 games enter at
+19.8% vs 2.9% for falling ones), newness (first seen under 48h ago enters
+4-5x as often), and absence from top-trending (already-trending games rarely
+surge into this chart). The component replaces 75% of the Monte Carlo mass
+for games ranked 21+, where the diffusion is known to be blind.
+
 The Monte Carlo occupancy is blended 90/10 with a recency-weighted empirical
 occupancy over the last 6 reads (12h half-life), capped at 0.55 per cell,
-floored at 0.002, and scaled so each place names at most 0.80 of the mass --
-the unnamed 0.20 residual covers off-chart entrants, which take several top-10
-slots in every 72h window. The ordered top 10 is by mean simulated rank.
+floored at 0.002, and scaled so each place names at most 1 - RESIDUAL[place]
+of the mass. The residual is per-place in v2: bottom places churn harder and
+leave more occupants unnamed (place 7 leaves 39% unnamed, place 5 only 11%),
+so place 7 keeps 0.30 unnamed while place 5 keeps 0.16. The ordered top 10
+is by mean simulated rank.
 
-Tuned on five backtest windows (2026-10-31 .. 2026-11-10, 46 scored reads):
-mean log score -36.07 vs -47.18 for the persistence baseline. Deterministic:
-fixed seed, no network, stdlib only.
+Validated on five backtest windows (2026-10-31 .. 2026-11-10, 46 scored
+reads), 3000 paths, shipped code: mean log score -35.74 vs -36.04 for v1 and
+-47.18 for the persistence baseline; practice window -33.33 vs -33.88 for v1
+(W1 +0.56, W2 +0.34, W4 +0.81, W5 +0.21, W3 -0.42 on an 8-read window where a
+single deep-rank game held places 1 and 3). Deterministic: fixed seed, no
+network, stdlib only.
 """
 
 import json
@@ -28,7 +44,7 @@ import os
 import random
 from datetime import datetime
 
-# ---- tuned constants (5-window backtest) ----
+# ---- tuned constants (5-window backtest, v1 core) ----
 PATHS = 3000
 HORIZON_H = 72
 SEED = 12345
@@ -48,11 +64,25 @@ OCC_READS = 6
 OCC_HALFLIFE_H = 12.0
 W_MC = 0.90
 W_OCC = 0.10
-RESIDUAL = 0.20
 P_CAP = 0.55
 P_MIN = 0.002
 ROWS_PER_PLACE = 40
 AGE_OUT_H = 28 * 24
+# ---- v2: per-place unnamed residual (place 1 .. 10) ----
+RESIDUAL = (0.22, 0.22, 0.23, 0.20, 0.16, 0.22, 0.30, 0.18, 0.18, 0.24)
+# ---- v2: entrant component ----
+ENT_W = 0.75
+ENT_MIN_RANK = 21
+ENT_VEL_A = 0.6
+ENT_NEW_H = 48.0
+ENT_NEW_MULT = 2.5
+ENT_TT_MULT = 0.5
+# Empirical share of each place's occupants coming from each deep band,
+# measured over 47 forecast points in the history (n=477 reads per place).
+ENT_SHARE_21_40 = (0.090, 0.109, 0.061, 0.021, 0.027,
+                   0.042, 0.109, 0.088, 0.119, 0.096)
+ENT_SHARE_41P = (0.059, 0.105, 0.138, 0.040, 0.080,
+                 0.092, 0.126, 0.140, 0.080, 0.117)
 
 
 def parse_ts(text):
@@ -151,17 +181,59 @@ def last_read_share_growth(rows, uids):
     return growth
 
 
+def entrant_matrix(uids, closing, raw_vel, age_list, on_tt):
+    """Per-game entry mass by place for deep-rank games.
+
+    Each deep band gets its empirical share of each place; inside a band the
+    share splits by entry score: climbing velocity, newness, and absence from
+    top-trending. Games ranked above ENT_MIN_RANK get no entrant mass.
+    """
+    count = len(uids)
+    ent = [[0.0] * 10 for _ in range(count)]
+    scores = []
+    for i in range(count):
+        if closing[uids[i]] < ENT_MIN_RANK:
+            scores.append(0.0)
+            continue
+        vel = max(-3.0, min(3.0, raw_vel[i]))
+        score = math.exp(-ENT_VEL_A * vel)
+        if age_list[i] < ENT_NEW_H:
+            score *= ENT_NEW_MULT
+        if on_tt[i]:
+            score *= ENT_TT_MULT
+        scores.append(score)
+    bands = ((21, 40, ENT_SHARE_21_40), (41, 10 ** 9, ENT_SHARE_41P))
+    for lo, hi, share in bands:
+        members = [i for i in range(count) if lo <= closing[uids[i]] <= hi]
+        total = sum(scores[i] for i in members)
+        if total <= 0:
+            continue
+        for i in members:
+            weight = scores[i] / total
+            for k in range(10):
+                ent[i][k] = weight * share[k]
+    return ent
+
+
 def simulate(rows):
     series, closing, t_end = collect(rows)
     uids = sorted(closing, key=lambda u: closing[u])
     count = len(uids)
     growth = last_read_share_growth(rows, uids)
+    tt_close = {g["universe_id"] for g in (rows[-1].get("top_trending") or [])}
     drift = []
     kick = []
     sigma = []
     age_out = []
+    raw_vel = []
+    age_list = []
+    on_tt = []
     for uid in uids:
         vel = rank_velocity(series[uid]["ranks"], t_end)
+        raw_vel.append(vel)
+        first_seen = series[uid]["ranks"][0][0]
+        age_list.append((t_end - first_seen).total_seconds() / 3600.0)
+        on_tt.append(1 if uid in tt_close else 0)
         drift.append(max(-DRIFT_CAP, min(DRIFT_CAP, DRIFT_SHRINK * vel)))
         kick.append(-SURGE_DRIFT if growth.get(uid, 0) >= SURGE_RATIO else 0.0)
         sigma.append(SIG_BASE + SIG_PER_RANK * closing[uid])
@@ -171,6 +243,7 @@ def simulate(rows):
         else:
             hours_left = (created - t_end).total_seconds() / 3600.0 + AGE_OUT_H
             age_out.append(max(0.0, hours_left))
+    ent = entrant_matrix(uids, closing, raw_vel, age_list, on_tt)
     rng = random.Random(SEED)
     occ = [[0.0] * 10 for _ in range(count)]
     rank_total = [0.0] * count
@@ -206,7 +279,7 @@ def simulate(rows):
     mc = [[occ[i][k] / norm for k in range(10)] for i in range(count)]
     mean_rank = [rank_total[i] / rank_seen[i] if rank_seen[i] else 99.0
                  for i in range(count)]
-    return uids, closing, mc, mean_rank, rows, t_end
+    return uids, closing, mc, mean_rank, rows, t_end, ent
 
 
 def empirical_occupancy(rows, t_end, uids):
@@ -229,7 +302,7 @@ def empirical_occupancy(rows, t_end, uids):
 
 
 def build_forecast(rows):
-    uids, closing, mc, mean_rank, rows, t_end = simulate(rows)
+    uids, closing, mc, mean_rank, rows, t_end, ent = simulate(rows)
     emp = empirical_occupancy(rows, t_end, uids)
     count = len(uids)
     probabilities = []
@@ -237,13 +310,15 @@ def build_forecast(rows):
         column = []
         for i in range(count):
             p = W_MC * mc[i][place] + W_OCC * emp[i][place]
+            if closing[uids[i]] >= ENT_MIN_RANK:
+                p = (1.0 - ENT_W) * p + ENT_W * ent[i][place]
             if p >= P_MIN:
                 column.append((min(p, P_CAP), uids[i]))
         column.sort(reverse=True)
         column = column[:ROWS_PER_PLACE]
         total = sum(p for p, _ in column)
         if total > 0:
-            scale = min(1.0, (1.0 - RESIDUAL) / total)
+            scale = min(1.0, (1.0 - RESIDUAL[place]) / total)
             for p, uid in column:
                 probabilities.append({"universe_id": uid, "place": place + 1,
                                       "p": round(p * scale, 6)})
